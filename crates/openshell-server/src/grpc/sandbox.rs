@@ -3487,6 +3487,12 @@ async fn stream_exec_over_relay(
         .await
         .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
+    let (exec_tx, coalescer) = if command.starts_with(openshell_core::ssh_exec::ARGV_PREFIX) {
+        let (exec_tx, task) = spawn_exec_output_coalescer(tx.clone());
+        (exec_tx, Some(task))
+    } else {
+        (tx.clone(), None)
+    };
     let exec = run_exec_with_russh(
         local_proxy_port,
         command,
@@ -3494,10 +3500,13 @@ async fn stream_exec_over_relay(
         request_tty,
         no_login_shell,
         (cols, rows),
-        tx.clone(),
+        exec_tx,
     );
 
     let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    if let Some(task) = coalescer {
+        let _ = task.await;
+    }
     if matches!(exec_result, Ok(None)) {
         let _ = tx
             .send(Ok(ExecSandboxEvent {
@@ -3564,6 +3573,12 @@ async fn stream_interactive_exec_over_relay(
         .await
         .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
 
+    let (exec_tx, coalescer) = if command.starts_with(openshell_core::ssh_exec::ARGV_PREFIX) {
+        let (exec_tx, task) = spawn_exec_output_coalescer(tx.clone());
+        (exec_tx, Some(task))
+    } else {
+        (tx.clone(), None)
+    };
     let exec = run_interactive_exec_with_russh(
         local_proxy_port,
         command,
@@ -3572,10 +3587,13 @@ async fn stream_interactive_exec_over_relay(
         no_login_shell,
         cols,
         rows,
-        tx.clone(),
+        exec_tx,
     );
 
     let exec_result = wait_for_exec_terminal(exec, execution_timeout, completion).await;
+    if let Some(task) = coalescer {
+        let _ = task.await;
+    }
     if matches!(exec_result, Ok(None)) {
         let _ = tx
             .send(Ok(ExecSandboxEvent {
@@ -3611,6 +3629,110 @@ async fn stream_interactive_exec_over_relay(
 }
 
 /// `Ok(Some(code))` requires a real SSH `ExitStatus`, including nonzero codes.
+/// How long small exec output chunks are merged before being sent to the client.
+const EXEC_OUTPUT_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(5);
+/// Merged output is sent immediately once it reaches this size.
+const EXEC_OUTPUT_COALESCE_MAX: usize = 64 * 1024;
+
+/// Send any merged output as one event. Returns false when the client is gone.
+async fn flush_exec_output(
+    pending: &mut Option<(bool, Vec<u8>)>,
+    tx: &mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> bool {
+    use openshell_core::proto::exec_sandbox_event::Payload;
+
+    let Some((is_stderr, data)) = pending.take() else {
+        return true;
+    };
+    let payload = if is_stderr {
+        Payload::Stderr(ExecSandboxStderr { data })
+    } else {
+        Payload::Stdout(ExecSandboxStdout { data })
+    };
+    tx.send(Ok(ExecSandboxEvent {
+        payload: Some(payload),
+    }))
+    .await
+    .is_ok()
+}
+
+/// Merge consecutive chunks of one stream; a stream switch or a full buffer flushes.
+async fn buffer_exec_output(
+    pending: &mut Option<(bool, Vec<u8>)>,
+    tx: &mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    is_stderr: bool,
+    data: &[u8],
+) -> bool {
+    match pending.as_mut() {
+        Some((kind, buffer)) if *kind == is_stderr => buffer.extend_from_slice(data),
+        _ => {
+            if !flush_exec_output(pending, tx).await {
+                return false;
+            }
+            *pending = Some((is_stderr, data.to_vec()));
+        }
+    }
+    if pending
+        .as_ref()
+        .is_some_and(|(_, buffer)| buffer.len() >= EXEC_OUTPUT_COALESCE_MAX)
+    {
+        return flush_exec_output(pending, tx).await;
+    }
+    true
+}
+
+/// Merge small output events before they reach the client. Only used for MXC
+/// (structured argv) execs, so other drivers keep their event boundaries.
+///
+/// Returns the sender the exec loop should write to and the task to await once
+/// the exec has finished, so merged output is delivered before the exit event.
+fn spawn_exec_output_coalescer(
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> (
+    mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use openshell_core::proto::exec_sandbox_event::Payload;
+
+    let (inner_tx, mut inner_rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(64);
+    let task = tokio::spawn(async move {
+        let mut pending: Option<(bool, Vec<u8>)> = None;
+        loop {
+            let next = if pending.is_some() {
+                if let Ok(next) =
+                    tokio::time::timeout(EXEC_OUTPUT_COALESCE_WINDOW, inner_rx.recv()).await
+                {
+                    next
+                } else {
+                    if !flush_exec_output(&mut pending, &tx).await {
+                        return;
+                    }
+                    continue;
+                }
+            } else {
+                inner_rx.recv().await
+            };
+            let Some(item) = next else {
+                break;
+            };
+            let forwarded = match item {
+                Ok(ExecSandboxEvent {
+                    payload: Some(Payload::Stdout(output)),
+                }) => buffer_exec_output(&mut pending, &tx, false, &output.data).await,
+                Ok(ExecSandboxEvent {
+                    payload: Some(Payload::Stderr(output)),
+                }) => buffer_exec_output(&mut pending, &tx, true, &output.data).await,
+                other => flush_exec_output(&mut pending, &tx).await && tx.send(other).await.is_ok(),
+            };
+            if !forwarded {
+                return;
+            }
+        }
+        flush_exec_output(&mut pending, &tx).await;
+    });
+    (inner_tx, task)
+}
+
 /// Synthetic gateway timeouts, lost status, and dropped futures leave the claim
 /// unresolved. Finalization precedes terminal delivery to the client.
 pub(super) async fn wait_for_exec_terminal(
@@ -4362,10 +4484,34 @@ mod tests {
         assert_eq!(payload.command, req.command);
         assert_eq!(payload.environment, req.environment);
         assert_eq!(payload.workdir, req.workdir);
-        assert_eq!(
-            exec_relay_command(&req, "docker").unwrap(),
-            build_remote_exec_command(&req).unwrap()
-        );
+        // Non-MXC drivers keep the historical POSIX shell string. Pin literals so
+        // this cannot pass by comparing a function with itself.
+        let linux = ExecSandboxRequest {
+            command: vec!["echo".into(), "a b".into()],
+            ..Default::default()
+        };
+        for driver in ["docker", "podman", "kubernetes"] {
+            assert_eq!(exec_relay_command(&linux, driver).unwrap(), "echo 'a b'");
+        }
+    }
+
+    #[test]
+    fn mxc_exec_relay_rejects_tty_and_oversized_commands() {
+        let tty = ExecSandboxRequest {
+            command: vec!["cmd.exe".into()],
+            tty: true,
+            ..Default::default()
+        };
+        let error = exec_relay_command(&tty, "mxc").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("--no-tty"));
+
+        let huge = ExecSandboxRequest {
+            command: vec!["x".repeat(MAX_COMMAND_STRING_LEN + 1)],
+            ..Default::default()
+        };
+        let error = exec_relay_command(&huge, "mxc").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     // ---- build_remote_exec_command ----
