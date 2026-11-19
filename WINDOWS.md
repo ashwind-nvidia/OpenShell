@@ -28,7 +28,16 @@ under development and is not a production-qualified security boundary:
   Treat the gateway host as trusted.
 - Foreground main-process attachment and ConPTY resize are unavailable. Create
   command workloads with `--detach`.
-- Gateway restart recovery for live MXC runtimes is not supported.
+- Gateway exit ends sandbox workloads, and there is no restart recovery. When
+  the gateway process ends (a graceful stop with Ctrl-C, a crash, or a kill), the
+  sandbox processes it started end with it, workloads included. After the gateway
+  restarts on the same database, each sandbox record is still listed but its
+  workload is not restarted, and its phase is not updated to show that the
+  workload ended (for example `Provisioning` after a graceful stop, `Ready` after
+  a hard kill). Delete the record to reuse its name. The Docker, Podman and VM
+  drivers stop sandboxes on a graceful gateway stop and recover them on restart;
+  MXC does not provide that recovery. See
+  [gateway exit and restart](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md#gateway-exit-and-restart).
 - Sandbox upload and download require POSIX file-transfer helpers and are unavailable.
 
 See the Windows branch's [MXC driver documentation](https://github.com/NVIDIA/OpenShell/blob/windows/crates/openshell-driver-mxc/README.md)
@@ -74,14 +83,20 @@ mise run --skip-tools windows:build:arm64
 The tasks produce `openshell.exe`, `openshell-gateway.exe`,
 `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` under
 `target/<target-triple>/release/`. Keep these binaries from the same build
-together with the matching `libz3.dll` staged by the build task. The target
-triples are `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
-`CARGO_TARGET_DIR` can override the output root.
-The runtime host also needs the matching Visual C++ runtime.
+together. The target triples are `x86_64-pc-windows-msvc` and
+`aarch64-pc-windows-msvc`. `CARGO_TARGET_DIR` can override the output root.
 
-The build uses pinned prebuilt Z3 by default. Compile and test hosts do not
-need a working MXC runtime; running native sandboxes does. These tasks do not
-install an MSI, register a Windows service, or publish a release.
+Windows tasks embed the CRT in all four executables and Z3 in the gateway by
+default. They reuse the pinned Z3 5.1.0 static `/MT` package from
+`ghcr.io/nvidia/openshell/z3`, verify its digests, and cache it locally. Downloads
+use HTTPS; Docker and a GHCR login are not required. Z3 builds from source only
+when its package is unavailable or source is explicitly requested. These
+executables do not need `libz3.dll` or the Visual C++ redistributable.
+See [Windows build options](CONTRIBUTING.md#windows-full-build) for overrides.
+
+Compile and test hosts do not need a working MXC runtime; running native
+sandboxes does. These tasks do not install an MSI, register a Windows service,
+or publish a release.
 
 ## Prepare and run MXC
 

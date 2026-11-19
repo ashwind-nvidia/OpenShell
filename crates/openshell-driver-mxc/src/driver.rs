@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::child::{ChildCommand, ChildStdio, GenerationChild};
 use base64::Engine as _;
 use futures::Stream;
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
@@ -27,7 +28,6 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
@@ -898,7 +898,13 @@ async fn run_lifecycle_inner(
     // ProcessContainer launch so unrelated local processes cannot squat it
     // during the more expensive host-side setup.
     drop(proxy_reservation);
-    let mut supervisor = spawn_supervisor(context, &descriptor_path, &auth_bundle_path, &main)?;
+    // One kill-on-close job per generation owns the supervisor and the whole
+    // boundary tree. Every early return below drops it, which ends whatever was
+    // already started.
+    let job = crate::job::GenerationJob::new()
+        .map_err(|error| format!("create sandbox job object: {error}"))?;
+    let mut supervisor =
+        spawn_supervisor(context, &descriptor_path, &auth_bundle_path, &main, &job)?;
     let sandbox_command = encode_windows_command_line(&[
         context.config.sandbox_binary_path.clone(),
         "--bootstrap".to_string(),
@@ -936,6 +942,7 @@ async fn run_lifecycle_inner(
             process,
             Some(network),
             mapped.ui,
+            &job,
         )
         .await
         .map_err(|error| format!("start MXC ProcessContainer: {error}"))?;
@@ -979,6 +986,12 @@ async fn run_lifecycle_inner(
     }
     drop(startup_guard.take());
     let result = monitor_runtime_pair(boundary, supervisor, shutdown_rx).await;
+    // Whatever ended the pair, end the rest of the tree (workload, conhost,
+    // grandchildren) that `Child::kill` on the two roots does not reach. This must
+    // happen before the terminated signal below: a restart waits on that signal and
+    // must not start a replacement while any process of this generation is alive.
+    job.terminate();
+    drop(job);
     if let Ok(mut attribution) = context.attribution.lock() {
         attribution.forget(&context.sandbox.id);
     }
@@ -1006,9 +1019,10 @@ fn spawn_supervisor(
     descriptor_path: &Path,
     auth_bundle_path: &Path,
     main: &openshell_core::sandbox_env::MainProcessConfig,
-) -> Result<Child, String> {
-    supervisor_command(context, descriptor_path, auth_bundle_path, main)?
-        .spawn()
+    job: &crate::job::GenerationJob,
+) -> Result<GenerationChild, String> {
+    let command = supervisor_command(context, descriptor_path, auth_bundle_path, main)?;
+    job.spawn(&command)
         .map_err(|error| format!("start host openshell-supervisor: {error}"))
 }
 
@@ -1017,14 +1031,14 @@ fn supervisor_command(
     descriptor_path: &Path,
     auth_bundle_path: &Path,
     main: &openshell_core::sandbox_env::MainProcessConfig,
-) -> Result<Command, String> {
+) -> Result<ChildCommand, String> {
     let main_process_spec = mxc_main_process_spec(main)?;
-    let mut command = Command::new(&context.config.supervisor_binary_path);
+    // A `GenerationChild` is killed when dropped, as `kill_on_drop(true)` did.
+    let mut command = ChildCommand::new(&context.config.supervisor_binary_path);
     command
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdin(ChildStdio::Null)
+        .stdout(ChildStdio::Piped)
+        .stderr(ChildStdio::Piped)
         .arg("--role")
         .arg("isolation-backend")
         .arg("--backend-descriptor-file")
@@ -1105,8 +1119,8 @@ enum RuntimePairExit {
 }
 
 async fn monitor_runtime_pair(
-    mut boundary: Child,
-    mut supervisor: Child,
+    mut boundary: GenerationChild,
+    mut supervisor: GenerationChild,
     mut shutdown: oneshot::Receiver<()>,
 ) -> RuntimePairExit {
     tokio::select! {
@@ -1685,7 +1699,7 @@ async fn wait_for_termination(
     }
 }
 
-fn attach_child_logs(sandbox_name: &str, component: &'static str, child: &mut Child) {
+fn attach_child_logs(sandbox_name: &str, component: &'static str, child: &mut GenerationChild) {
     if let Some(stdout) = child.stdout.take() {
         let sandbox_name = sandbox_name.to_string();
         tokio::spawn(async move {
@@ -2055,10 +2069,9 @@ mod tests {
         )
         .unwrap();
         let tls_dir = command
-            .as_std()
             .get_envs()
             .find(|(key, _)| *key == openshell_core::sandbox_env::PROXY_TLS_DIR)
-            .and_then(|(_, value)| value);
+            .map(|(_, value)| value);
         assert_eq!(
             tls_dir.map(Path::new),
             Some(host_state_dir.join(HOST_PROXY_TLS_DIR).as_path())
@@ -2983,17 +2996,20 @@ mod tests {
 
     #[tokio::test]
     async fn stop_terminates_and_reaps_both_runtime_processes() {
+        let job = crate::job::GenerationJob::new().expect("job");
         let spawn = || {
-            Command::new("powershell.exe")
+            let mut command = ChildCommand::new("powershell.exe");
+            command
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
                     "Start-Sleep -Seconds 60",
                 ])
-                .kill_on_drop(true)
-                .spawn()
-                .expect("real test process")
+                .stdin(ChildStdio::Null)
+                .stdout(ChildStdio::Null)
+                .stderr(ChildStdio::Null);
+            job.spawn(&command).expect("real test process")
         };
         let boundary = spawn();
         let supervisor = spawn();

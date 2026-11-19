@@ -223,7 +223,8 @@ not required; driver-owned guest TLS fields are rejected.
 | Sandbox restart | Retire the old runtime and launch from the stored spec with fresh authentication. Policy-granted workspace files persist. |
 | Dynamic forwarding | Standard supervisor `ForwardTcp` path through sandbox loopback connect |
 | ETW/OCSF audit | Optional Windows Sandboxing ETW consumer |
-| Gateway restart recovery | Not yet supported; live MXC generations remain in-memory |
+| Gateway exit | Ends the sandbox processes, workloads included ([details](#gateway-exit-and-restart)) |
+| Gateway restart recovery | Not supported; live MXC generations remain in-memory and are not recovered |
 
 Workloads receive the proxy CA in `NODE_EXTRA_CA_CERTS` and `DENO_CERT`, and a
 combined bundle in `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and
@@ -255,13 +256,53 @@ explicit UI policy (including `{}`) for drivers missing this capability; those
 drivers need no UI-specific handling. UI policy itself does not require the
 `allow_driver_config` opt-in. Recreate the sandbox to change these settings.
 
+## Gateway exit and restart
+
+The driver runs inside the gateway. Each sandbox generation runs in its own
+Windows job object with kill-on-close: the host supervisor and `wxc-exec` are
+created inside it (the job is named in the `CreateProcessW` call, so no process
+of a generation ever exists outside its job, even if the gateway is killed
+mid-spawn), and the boundary and workload processes below them inherit it. When a generation stops, the job is terminated, and when the gateway process
+ends for any reason Windows closes the job and ends everything in it. In
+practice:
+
+- **Stop and delete** end the whole generation: supervisor, `wxc-exec`, boundary
+  and workload, not only the two direct children.
+- **Graceful gateway stop** (Ctrl-C) ends every sandbox process, workloads
+  included, and frees the gateway port.
+- **Gateway crash or hard kill** ends every sandbox process through the job, and
+  the listening socket is not inherited by any child, so a new gateway can bind
+  the port at once.
+
+MXC does not recover sandboxes across a gateway restart. The Docker, Podman and
+VM drivers stop their sandboxes on a graceful gateway stop and recover them when
+the gateway starts again; MXC reports `gateway_manages_lifecycle: false`, so the
+gateway skips that shutdown sweep and startup recovery for it, and live
+generations exist only in the driver's memory. After a restart on the same
+database:
+
+- each sandbox record is still listed, with the phase it had when the gateway
+  went away (for example `Provisioning` after a graceful stop, `Ready` after a
+  hard kill); nothing updates it to show that the workload ended;
+- no workload is running, and nothing restarts it;
+- `openshell sandbox delete <name>` removes the record, and the name can then be
+  created again.
+
+Treat a sandbox that was running when the gateway exited as lost, delete its
+record, and create it again. The `gateway-kill` and `gateway-restart` E2E
+scenarios (see [Validation](#validation)) check this behavior. Behavior for a
+driver that runs as its own process, separate from the gateway, is not defined
+yet.
+
 ## Validation
 
-Windows release build tasks stage the pinned, target-matching `libz3.dll` beside
-the gateway and verify its architecture and copied SHA256. Conflicting cached
-DLLs fail the build instead of selecting an arbitrary runtime. Local E2E requires
-this adjacent DLL; rebuild for the native architecture if preflight reports it
-missing.
+Windows build tasks embed the CRT in all four executables and Z3 in the
+gateway by default. They download and cache the pinned Z3 5.1.0 static `/MT`
+package from GHCR, with source fallback when unavailable. Release builds reject
+Z3 or redistributable CRT DLL imports. The resulting executables need neither
+`libz3.dll` nor the Visual C++ redistributable. See
+[Windows build options](../../CONTRIBUTING.md#windows-full-build) for explicit
+source, library, and legacy shared-mode overrides.
 
 ### Remote Windows host
 
@@ -285,11 +326,11 @@ architecture before testing. `-BuildDirectory` selects a dedicated Cargo cache.
 `-SkipBuild` reuses existing artifacts without claiming they match current
 sources. `-Scenario` selects an existing harness scenario.
 
-The package includes `libz3.dll` from the target-specific Cargo build cache.
-Windows prebuilt Z3 uses a dynamic runtime DLL. Supply `-Z3DllPath` if multiple
-different cached versions exist or when using a custom Z3 build. The remote
-host needs the native Visual C++ runtime; the runner validates DLL architecture
-and gateway startup before invoking E2E.
+The remote helper reads gateway imports and includes `libz3.dll` only for
+shared builds. `-Z3DllPath` can select a matching DLL for those builds; their
+runtime host also needs the native Visual C++ runtime. The helper checks DLL
+architecture and gateway startup before E2E. Default static builds omit the DLL.
+The separate MXC executor retains its own prerequisites.
 
 The example gateway explicitly enables caller driver config so tests can submit
 their workload command and directory. MXC does not implement external-resource
@@ -350,7 +391,7 @@ explicitly loads the boundary-injected CA bundle and records the peer certificat
 success requires a nonempty response and the OpenShell proxy CA issuer. It does
 not install a host trust root or disable CA/hostname verification. The fixture
 uses best-effort Schannel revocation because the ephemeral private CA has no CRL
-distribution point; it does not qualify revocation enforcement. The default seven E2E
+distribution point; it does not qualify revocation enforcement. The default E2E
 scenarios remain independent of Internet access.
 
 The `forwarding` scenario starts a TCP listener inside MXC, then verifies two
@@ -374,12 +415,33 @@ host service is checked before launch and stopped after testing. Select it with
 `-Scenario host-service`; no Internet access, LAN address, or firewall changes
 are required. This verifies direct localhost connectivity.
 
+The default `gateway-kill` scenario checks sandbox cleanup when the gateway dies
+without warning. It creates a sandbox with a long-running workload, records the
+sandbox process tree under that gateway, hard-kills the gateway, and requires
+every recorded process to end and the gateway port to be bindable again (a
+replacement gateway must start on it). Only processes under the scenario's own
+gateway are tracked, so other sandboxes on the host are left alone. It relies on
+each sandbox generation's kill-on-close job object; no workload outlives the
+gateway. Select it with `-Scenario gateway-kill`.
+
+The default `gateway-restart` scenario covers a graceful gateway stop with
+persisted state. It runs the gateway on a SQLite file, creates a sandbox with a
+long-running workload, sends a real Ctrl-C, and requires the gateway to log a
+graceful shutdown and exit, every recorded sandbox process to end, and a restart
+on the same database to start. After the restart the sandbox record must still be
+listed (the observed phase is `Provisioning` and does not change), its workload
+must not be running (MXC has no restart recovery), and the record must be
+deletable with its name reusable. The scenario pins today's no-recovery behavior,
+so it needs updating when recovery is added. A graceful stop ends the workloads
+with or without the per-generation job; the job is what covers a hard kill.
+Select it with `-Scenario gateway-restart`.
+
 The `ws-agent.yaml` and `openclaw-gateway.yaml` policies preserve the Windows
 branch's workload grants. `inference.yaml` is a template: replace its filesystem,
 curl executable, inference host, and port placeholders before use. Authorize
 curl, which owns the network socket, not its cmd launcher. These policies have
 parser/mapper regression coverage; they do not add live WebSocket, OpenClaw,
-or provider-backed inference scenarios to the seven-scenario E2E runner.
+or provider-backed inference scenarios to the E2E runner.
 
 With `-KeepRunning`, the runner restores the caller's environment but retains
 the disposable CLI/runtime directory for the live gateway and prints its path.
@@ -415,10 +477,24 @@ binaries. This requires elevation or Performance Log Users membership. It checks
 the shipped config and coverage classifier before requiring all seven event types
 in the durable JSONL output; the ordinary E2E scenarios do not check this path.
 
-On the ARM64 test host (Windows build 28120, MXC 1.0.0), Sandboxing ETW records
-come from the shared Appinfo broker rather than the driver-owned executor.
-The consumer cannot correlate these records using the executor's PID and process
-generation, so live audit qualification currently fails even though the workload
-completes. The executor diagnostic log redacts its container identity. A trusted
-broker-to-launch correlation is needed; treating the shared broker PID as a
-sandbox identity would misattribute concurrent sandboxes and is not supported.
+On some Windows builds (observed on ARM64, Windows build 28000), Sandboxing ETW records
+come from the shared Appinfo broker rather than the driver-owned executor, so they
+cannot be matched to a sandbox by the executor's PID and process generation. The
+consumer attributes them through the `ProcessLaunched` record instead. That record
+names the process the OS started inside the sandbox, and it is attributed to a
+sandbox only when that process is a child of a live, registered executor (checked by
+the executor's process start key) and was created no later than the record was
+emitted. The record carries no start key for the child, so the creation-time bound
+is what rules out a PID that was reused before the record reached the consumer
+(records arrive about a second after they are emitted); when the bound cannot be
+established, the record is not attributed. The record's activity id then attributes
+the rest of the create burst. On a host that shows this behaviour, live audit
+qualification passes with all seven event types. Treating the shared broker PID as a sandbox identity would
+misattribute concurrent sandboxes and is not supported.
+
+Records that cannot be attributed are counted. The provider is system-wide, so some
+may belong to another gateway or consumer: a record that waited while this gateway
+had a live sandbox counts as possible loss and raises a warning that does not claim
+a confirmed gap, and one that arrived while it had none is counted separately and
+never warned about. Pending records are replayed and counted when the session stops,
+before the final warning.
