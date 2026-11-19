@@ -129,9 +129,17 @@ text as one argument to `cmd.exe /d /c`, for example:
 openshell sandbox exec my-sandbox --no-tty -- cmd.exe /d /c "dir C:\Windows"
 ```
 
-Use `openshell sandbox start <name>` to relaunch a stopped sandbox or one
-whose main process completed. The new runtime uses the original sandbox
-configuration and retains files in the policy-granted host workspace.
+The command's standard output and error, and its exit status (including
+nonzero and crash-style codes), are returned. A missing or unlaunchable
+executable fails with an `openshell: <reason>` message and exit status 1.
+`sandbox exec` needs `--no-tty`; `sandbox connect`, `--tty`, and file
+upload/download are unavailable on MXC. Exec is supported for ProcessContainer
+sandboxes only; `isolation_session` sandboxes do not support it.
+
+Use `openshell sandbox start <name>` to relaunch a stopped sandbox, one whose
+main process completed, or one whose main process failed. The new runtime uses
+the original sandbox configuration and retains files in the policy-granted host
+workspace. Processes started by `sandbox exec` end when the runtime stops.
 
 ## Validate
 
