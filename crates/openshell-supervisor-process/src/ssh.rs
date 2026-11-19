@@ -635,6 +635,23 @@ struct SshHandler {
 
 impl Drop for SshHandler {
     fn drop(&mut self) {
+        // A dropped connection (client timeout, gateway relay teardown) never
+        // delivers `channel_close`, so channel ownership of an exec process must
+        // also end here or the process would run on inside the sandbox. Limited
+        // to Windows so Linux supervisor behavior is unchanged.
+        #[cfg(windows)]
+        for state in self.channels.values_mut() {
+            if state.main_attached {
+                continue;
+            }
+            if let Some(process) = state.process.take()
+                && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            {
+                runtime.spawn(async move {
+                    let _ = process.terminate().await;
+                });
+            }
+        }
         let Some(main_session) = self.main_session.as_ref() else {
             return;
         };
@@ -1632,7 +1649,7 @@ impl SshHandler {
             };
             let code = match status {
                 Some(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
-                    code.max(0).cast_unsigned()
+                    exit_code_to_wire(code)
                 }
                 Some(openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
                     signal,
@@ -1696,6 +1713,15 @@ impl SshHandler {
     }
 }
 
+/// Map a child exit code to the SSH `exit-status` value without losing bits.
+///
+/// Windows exit codes are 32-bit (for example `0xC0000005` crashes arrive as
+/// negative `i32`), and SSH carries them as `u32`. Clamping negatives to 0 would
+/// report a crashed child as a success.
+fn exit_code_to_wire(code: i32) -> u32 {
+    code.cast_unsigned()
+}
+
 async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) -> bool {
     match event {
         MainOutput::Stdout(data) => handle.data(channel, data).await.is_ok(),
@@ -1703,7 +1729,7 @@ async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput
         MainOutput::Exit(code) => {
             let eof = handle.eof(channel).await.is_ok();
             let status = handle
-                .exit_status_request(channel, code.max(0).unsigned_abs())
+                .exit_status_request(channel, exit_code_to_wire(code))
                 .await
                 .is_ok();
             let close = handle.close(channel).await.is_ok();
@@ -1808,6 +1834,19 @@ fn direct_tcpip_target(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_code_to_wire_preserves_all_32_bits() {
+        assert_eq!(exit_code_to_wire(0), 0);
+        assert_eq!(exit_code_to_wire(7), 7);
+        assert_eq!(exit_code_to_wire(255), 255);
+        assert_eq!(exit_code_to_wire(256), 256);
+        // 0xC0000005 (access violation) arrives as a negative i32 on Windows
+        // and must never be reported as success.
+        assert_eq!(exit_code_to_wire(-1_073_741_819), 0xC000_0005);
+        assert_eq!(exit_code_to_wire(-1), u32::MAX);
+        assert_ne!(exit_code_to_wire(i32::MIN), 0);
+    }
 
     pub(super) struct AcceptAnyServerKey;
 
