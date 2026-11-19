@@ -14,6 +14,19 @@ fn main() -> std::io::Result<()> {
             println!("{}", arguments[2]);
             return Ok(());
         }
+        Some("--print-cwd") if arguments.len() == 2 => {
+            println!("{}", std::env::current_dir()?.display());
+            return Ok(());
+        }
+        Some("--print-env") if arguments.len() == 3 => {
+            // `<unset>` is not a valid value for the checks that use this, so it cannot
+            // be confused with a set variable.
+            println!(
+                "{}",
+                std::env::var(&arguments[2]).unwrap_or_else(|_| "<unset>".to_string())
+            );
+            return Ok(());
+        }
         Some("--exit-on-file") if arguments.len() == 4 => {
             let mut launches = std::fs::OpenOptions::new()
                 .create(true)

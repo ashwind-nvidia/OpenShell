@@ -46,7 +46,8 @@
 #   https-ca         - opt-in outbound HTTPS using the injected proxy CA.
 #   socket-owner-normalized         - opt in to equivalent Windows policy paths.
 #   socket-owner-normalized-default - equivalent spelling is denied by default.
-#   exec-restart     - opt-in argv, exit status, and restart from Completed and Stopped.
+#   exec-restart     - sandbox exec (argv, env, cwd, exit status, output) and restart from
+#                      Completed and Stopped. processcontainer only.
 
 [CmdletBinding()]
 param(
@@ -435,8 +436,6 @@ function Test-HostServiceResult([string]$work, [string]$nonce, [string]$requestL
     return 'two exact responses from the host service on 127.0.0.1'
 }
 
-# Exercise the public gRPC forward path, never dial the workload port directly.
-# The nonce identifies this workload, not an unrelated host-loopback listener.
 function Wait-RuntimePhase([string]$sandboxName, [string]$phase) {
     $deadline = (Get-Date).AddSeconds(45)
     do {
@@ -463,6 +462,61 @@ function Test-ExecRestart([string]$sandboxName, [string]$workload, [string]$laun
     $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', 'openshell-test-program-not-installed.exe') 15
     if ($result.ExitCode -ne 1 -or ($result.Output -join '') -notmatch 'openshell:') {
         throw "Exec did not report a spawn failure and exit status: $($result.Output)"
+    }
+
+    # Exit codes: large and crash-style (negative as a signed 32-bit value) codes must
+    # never be reported as success.
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', $cmdExe, '/d', '/c', 'exit /b 255') 15
+    if ($result.ExitCode -ne 255) { throw "Exec did not return exit status 255: exit $($result.ExitCode)" }
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', $cmdExe, '/d', '/c', 'exit /b -1073741819') 15
+    if ($result.ExitCode -eq 0) { throw 'Exec reported success for a crash-style exit status (0xC0000005)' }
+
+    # Large output: every line must arrive (no silent truncation) before the exit status.
+    $lines = 60000
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', $cmdExe, '/d', '/c', "for /l %i in (1,1,$lines) do @echo 0123456789012345678901234567890123456789012345678901234567890123456789") 180
+    $received = @(($result.Output -join "`n") -split '\r?\n' | Where-Object { $_ -ne '' }).Count
+    if ($result.ExitCode -ne 0 -or $received -ne $lines) {
+        $joined = $result.Output -join "`n"
+        $tail = $joined.Substring([Math]::Max(0, $joined.Length - 300)).Replace("`r", '').Replace("`n", ' | ')
+        throw "Exec lost output: expected $lines lines, received $received (exit $($result.ExitCode)); tail: $tail"
+    }
+
+    # A command that outlives --timeout must be stopped, not leaked inside the sandbox.
+    $timeoutNonce = "mxcto$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $started = Get-Date
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--timeout', '5', '--', $cmdExe, '/d', '/c', "for /l %i in (1,1,2000000000) do @rem $timeoutNonce") 60
+    if ($result.ExitCode -eq 0) { throw 'Exec past --timeout reported success' }
+    if (((Get-Date) - $started).TotalSeconds -gt 40) { throw "Exec did not stop near --timeout (took $([int]((Get-Date) - $started).TotalSeconds) s)" }
+    $leakDeadline = (Get-Date).AddSeconds(20)
+    do {
+        $leaked = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$timeoutNonce*" -and $_.ProcessId -ne $PID })
+        if ($leaked.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $leakDeadline)
+    if ($leaked.Count -gt 0) { throw "Exec past --timeout left $($leaked.Count) process(es) running: $(($leaked | ForEach-Object { "$($_.Name)($($_.ProcessId))" }) -join ', ')" }
+
+    # More literal-argument cases: shell metacharacters must reach the program as text,
+    # including one that would start a second command if a shell saw it.
+    foreach ($literal in @('a&whoami', 'a|b', 'a>b', '"quoted" and \', '%USERNAME% ^ !x!')) {
+        $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--', $workload, '--print-arg', $literal) 15
+        if ($result.ExitCode -ne 0 -or ($result.Output -join '').Trim() -cne $literal) {
+            throw "Exec changed the literal argument '$literal': exit $($result.ExitCode), output '$($result.Output)'"
+        }
+    }
+
+    # The requested working directory (with a space in it) and environment value are
+    # what the command sees.
+    $workDir = Join-Path (Split-Path -Parent $workload) 'exec work dir'
+    New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--workdir', $workDir, '--', $workload, '--print-cwd') 15
+    $reported = ($result.Output -join '').Trim()
+    if ($result.ExitCode -ne 0 -or -not [string]::Equals([IO.Path]::GetFullPath($reported), [IO.Path]::GetFullPath($workDir), [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Exec did not run in the requested working directory '$workDir': exit $($result.ExitCode), cwd '$reported'"
+    }
+    $envValue = 'two words & more'
+    $result = Invoke-NativeCaptured $cli @('sandbox', 'exec', $sandboxName, '--no-tty', '--env', "MXC_EXEC_TEST=$envValue", '--', $workload, '--print-env', 'MXC_EXEC_TEST') 15
+    if ($result.ExitCode -ne 0 -or ($result.Output -join '').Trim() -cne $envValue) {
+        throw "Exec did not pass the requested environment value: exit $($result.ExitCode), output '$($result.Output)'"
     }
 
     # The first main process exits normally while its supervisor remains alive.
@@ -495,6 +549,8 @@ function Test-ExecRestart([string]$sandboxName, [string]$workload, [string]$laun
     throw "Expected three launches in the retained workspace; found $($launches.Count)"
 }
 
+# Exercise the public gRPC forward path, never dial the workload port directly.
+# The nonce identifies this workload, not an unrelated host-loopback listener.
 function Test-Forwarding([string]$sandboxName, [string]$readyFile, [string]$nonce) {
     if (-not (Wait-File $readyFile 30)) { throw "MXC forwarding listener did not report readiness" }
     $targetPort = [int](Get-Content -LiteralPath $readyFile -Raw).Trim()
@@ -985,19 +1041,17 @@ try {
             Name = 'gateway-restart'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
             SandboxId = 'gr'; Backends = 'process_container'; Kind = 'gateway-restart'
             Description = 'graceful gateway stop ends sandbox processes; the record persists but is not recovered'
+        },
+        @{
+            Name = 'exec-restart'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
+            SandboxId = 'exec'; Backends = 'process_container'; Kind = 'exec-restart'
+            Description = 'structured argv, exit status, and fresh runtime with a retained workspace'
         }
     )
 
     # External connectivity is deliberately opt-in; the default scenarios
     # remain runnable without Internet access. Use the same authenticated
     # gateway launch path as every other workload, not a bare driver fixture.
-    if ($Scenario -eq 'exec-restart') {
-        $allScenarios += @{
-            Name = 'exec-restart'; PolicyFile = Join-Path $policyDir 'fs-rw.yaml'
-            SandboxId = 'exec'; Backends = 'process_container'; Kind = 'exec-restart'
-            Description = 'structured argv, exit status, and fresh runtime with a retained workspace'
-        }
-    }
     if ($Scenario -eq 'https-ca') {
         $allScenarios += @{
             Name = 'https-ca'; PolicyFile = Join-Path $policyDir 'https-ca.yaml'
@@ -1245,6 +1299,32 @@ try {
                     if ($createExitCode -ne 0) { throw "sandbox creation failed: $createOutStr" }
                     # Wait for the whole sandbox tree to exist, then record it.
                     $victims = Wait-SandboxTree $gw $killNonce
+
+                    # A command started through `sandbox exec` must be contained like the rest of
+                    # the generation: it must end with the gateway too.
+                    $null = Wait-RuntimePhase $sandboxName 'Ready'
+                    $execNonce = "mxcexec$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+                    $execText = "for /l %i in (1,1,2000000000) do @rem $execNonce"
+                    $execOut = Join-Path $resultDir 'exec-long-running.out'
+                    $execCli = Start-Process -FilePath $cli -WindowStyle Hidden -PassThru `
+                        -RedirectStandardOutput $execOut -RedirectStandardError "$execOut.err" `
+                        -ArgumentList ((@('sandbox', 'exec', $sandboxName, '--no-tty', '--', $cmdExe, '/d', '/c', $execText) | ForEach-Object { Quote-NativeArgument $_ }) -join ' ')
+                    $execVictims = @{}
+                    $execDeadline = (Get-Date).AddSeconds(30)
+                    do {
+                        Start-Sleep -Milliseconds 500
+                        foreach ($proc in @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$execNonce*" -and $_.ProcessId -ne $PID -and $_.ProcessId -ne $execCli.Id })) {
+                            $execVictims[[int]$proc.ProcessId] = $proc.Name
+                            foreach ($child in (Get-DescendantPids ([int]$proc.ProcessId))) {
+                                $childProc = Get-Process -Id $child -ErrorAction SilentlyContinue
+                                if ($childProc) { $execVictims[$child] = $childProc.ProcessName }
+                            }
+                        }
+                        $execRunning = $execVictims.Count -gt 0
+                    } while (-not $execRunning -and (Get-Date) -lt $execDeadline)
+                    if (-not $execRunning) { throw "the exec'd command did not start inside the sandbox: $(Get-Content $execOut, "$execOut.err" -ErrorAction SilentlyContinue)" }
+                    foreach ($id in $execVictims.Keys) { $victims[$id] = "exec:$($execVictims[$id])" }
+                    Info "exec'd command running inside the sandbox: $((($execVictims.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value)($($_.Key))" }) -join ', '))"
                     Info "tracking $($victims.Count) sandbox processes: $((($victims.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Value)($($_.Key))" })) -join ', ')"
 
                     Info "hard-killing gateway pid $($gw.Id)"
@@ -1262,6 +1342,9 @@ try {
                 } catch {
                     Bad "gateway-kill: $($_.Exception.Message)"
                     $results += [pscustomobject]@{ Scenario = $sc.Name; Result = 'FAIL'; Reason = $_.Exception.Message }
+                } finally {
+                    # Never leave the exec CLI behind; it holds its output files open.
+                    if ($execCli -and -not $execCli.HasExited) { Stop-Process -Id $execCli.Id -Force -ErrorAction SilentlyContinue }
                 }
             } elseif ($sc.Kind -eq 'gateway-restart') {
                 # Documents today's behavior (MXC has no restart recovery): a graceful

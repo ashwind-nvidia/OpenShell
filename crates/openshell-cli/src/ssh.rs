@@ -2791,9 +2791,17 @@ mod tests {
             config.contains("Host openshell-demo.beta"),
             "host alias should be workspace-qualified: {config}"
         );
+        // The ProxyCommand arguments are quoted for the host platform (a POSIX shell, or the
+        // Windows command-line parser), so build the expectation the same way production does.
+        let expected = format!(
+            "--gateway-name {} --name {} --workspace {}",
+            proxy_command_escape("my-gw"),
+            proxy_command_escape("demo"),
+            proxy_command_escape("beta"),
+        );
         assert!(
-            config.contains("--workspace beta"),
-            "ProxyCommand should include --workspace: {config}"
+            config.contains(&expected),
+            "ProxyCommand should carry the escaped gateway, name and workspace ({expected}): {config}"
         );
     }
 
